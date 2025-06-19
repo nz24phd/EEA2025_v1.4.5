@@ -1,0 +1,14 @@
+scenario: Weekday Peak_40%
+base_name: Weekday Peak_40%
+bdwpt_penetration: 40
+peak_load: -537.8274355034174
+min_load: -692.135194269116
+avg_load: -572.5129283459073
+total_energy_kwh: -13740.310280301775
+total_losses_kwh: 141.0602909963398
+min_voltage: 0.9725839576618949
+max_voltage: 0.9998474931134014
+bdwpt_energy_charged_kwh: 991.3694343452221
+bdwpt_energy_discharged_kwh: 809.3630787904433
+voltage_violations: 0
+reverse_flow_events: 96

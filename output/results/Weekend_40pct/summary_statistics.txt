@@ -1,0 +1,14 @@
+scenario: Weekend_40%
+base_name: Weekend_40%
+bdwpt_penetration: 40
+peak_load: -537.8244500356311
+min_load: -670.3017995277638
+avg_load: -565.4729260182271
+total_energy_kwh: -13571.35022443745
+total_losses_kwh: 137.9003879073963
+min_voltage: 0.9730836729044753
+max_voltage: 0.9998471235842551
+bdwpt_energy_charged_kwh: 1322.3867537978672
+bdwpt_energy_discharged_kwh: 985.4317836921017
+voltage_violations: 0
+reverse_flow_events: 96

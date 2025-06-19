@@ -1,0 +1,6 @@
+vehicle_type,count,battery_capacity_kwh,typical_range_km
+Nissan Leaf,3500,40,270
+Tesla Model 3,2000,75,500
+MG ZS EV,1500,44,320
+Hyundai Kona,1000,64,450
+Other,2000,60,400
