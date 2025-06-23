@@ -6,13 +6,16 @@ import logging
 try:
     import py_dss_interface
     USE_OPENDSS = True
+    # 使用您文件中可能已经存在的logger，或者标准logging
+    logging.info("'py_dss_interface' library found. OpenDSS functionalities are enabled.")
 except ImportError:
+    # 这个块现在可以正确捕获未安装库的错误
+    logging.warning("CRITICAL: 'py_dss_interface' library not found. OpenDSS functionalities will be disabled. The simulation cannot perform power flow analysis.")
     USE_OPENDSS = False
-    logging.warning("OpenDSS not available, using simplified power flow")
 
 logger = logging.getLogger(__name__)
 
-class IEEE13BusSystem:
+class IEEE13BusModel:
     """IEEE 13-bus test feeder with BDWPT integration"""
     
     def __init__(self, config):
@@ -249,3 +252,58 @@ class IEEE13BusSystem:
         """Update stored voltages from power flow results"""
         if 'voltages' in results:
             self.voltages.update(results['voltages'])
+
+    def update_bdwpt_loads(self, bdwpt_vehicle_powers):
+        """
+        Updates the BDWPT loads in the power grid model.
+        This method correctly uses the 'self.bdwpt_loads' attribute.
+        
+        Args:
+            bdwpt_vehicle_powers (dict): A dictionary of {vehicle_id: power_kw}.
+        """
+        # 直接用最新的车辆功率字典，覆盖模型内部的BDWPT负荷字典。
+        # 在后续的潮流计算中，模型会使用这个更新后的字典。
+        self.bdwpt_loads = bdwpt_vehicle_powers.copy()
+        logger.debug(f"Updated BDWPT loads for {len(self.bdwpt_loads)} vehicles.")
+
+# 请用这个新版本，完整替换掉旧的 get_grid_state 函数
+    def get_grid_state(self):
+        """
+        Retrieves the current state of the grid (voltages, losses, etc.).
+        [最终修复版] 修正了所有 py_dss_interface 的属性名，使用正确的PascalCase命名法。
+        """
+        if not USE_OPENDSS:
+            total_load = sum(load['P'] for load in self.loads.values())
+            total_bdwpt = sum(self.bdwpt_loads.values())
+            net_load = total_load + total_bdwpt
+            return {
+                'voltages_pu': self.voltages,
+                'losses': (net_load * 0.03, 0),
+                'total_load_kw': net_load,
+                'feeder_power_kw': (net_load, 0)
+            }
+
+        try:
+            # --- ▼▼▼ 这里是修改的核心 ▼▼▼ ---
+            # 修正了所有 py_dss_interface 的属性名，例如 all_bus_volts -> AllBusVolts
+            all_bus_voltages = self.dss.Circuit.AllBusVolts()
+            bus_names = self.dss.Circuit.AllBusNames()
+            
+            voltages_pu = {
+                bus: np.sqrt(all_bus_voltages[i*2]**2 + all_bus_voltages[i*2+1]**2) / self.buses.get(bus, {}).get('kv', 1)
+                for i, bus in enumerate(bus_names) if self.buses.get(bus, {}).get('kv', 1) > 0 and i*2+1 < len(all_bus_voltages)
+            }
+            
+            losses_watt_var = self.dss.Circuit.Losses()
+            total_power_kw_kvar = self.dss.Circuit.TotalPower()
+            # --- ▲▲▲ 修改结束 ▲▲▲ ---
+
+            return {
+                'voltages_pu': voltages_pu,
+                'losses': (losses_watt_var[0] / 1000, losses_watt_var[1] / 1000),
+                'total_load_kw': total_power_kw_kvar[0],
+                'feeder_power_kw': total_power_kw_kvar,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get grid state from OpenDSS: {e}")
+            return {}

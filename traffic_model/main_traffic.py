@@ -104,3 +104,17 @@ class TrafficModel:
             if v.get('is_bdwpt_equipped') and v.get('location') == power_node
         ]
         return vehicles_at_node
+    
+    # 请将这个新函数，添加到 TrafficModel 类的内部
+    def apply_scenario(self, scenario_config):
+        """Applies scenario-specific parameters to the traffic model."""
+        self.bdwpt_penetration = scenario_config.get('bdwpt_penetration', 0) / 100.0
+        self.traffic_multiplier = scenario_config.get('traffic_multiplier', 1.0)
+        
+        # Re-initialize vehicles with the new penetration rate
+        self._initialize_vehicles()
+        logging.info(
+            f"Scenario applied to traffic model: "
+            f"BDWPT Penetration={self.bdwpt_penetration:.0%}, "
+            f"Traffic Multiplier={self.traffic_multiplier}"
+        )

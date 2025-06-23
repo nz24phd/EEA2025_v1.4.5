@@ -346,7 +346,7 @@ class SimulationConfig:
             for warning in warnings:
                 logger.warning(f"⚠️  {warning}")
         
-        logger.info("✅ Configuration validation passed")
+        logger.info("[Success] Configuration validation passed")
         return True
 
     def get_required_packages(self):

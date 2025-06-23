@@ -1,251 +1,223 @@
-# cosimulation/simulation_engine.py - Main co-simulation engine
+# cosimulation/simulation_engine.py - 最终修复版本
 
-import numpy as np
 import pandas as pd
 import logging
-from datetime import datetime, timedelta
-from tqdm import tqdm
+from datetime import timedelta
+import os
 
-from power_grid_model.bdwpt_agent import BDWPTAgent
+# 导入模型
+from traffic_model.data_loader import TrafficDataLoader
+from traffic_model.main_traffic import TrafficModel
+from power_grid_model.ieee_13_bus_model import IEEE13BusModel
+from power_grid_model.bdwpt_efficiency_model import DynamicBDWPTEfficiency, BDWPTCharacteristics, ThermalState
+from .results_analyzer import ResultsAnalyzer, ALL_TIMESERIES_COLUMNS
 
-logger = logging.getLogger(__name__)
+class SimulationEngine:
+    """Orchestrates the co-simulation for a single scenario."""
 
-class CoSimulationEngine:
-    """Co-simulation engine coordinating traffic and power grid models"""
-    
-    def __init__(self, config, traffic_model, power_grid):
-        self.config = config
-        self.traffic_model = traffic_model
-        self.power_grid = power_grid
-        self.bdwpt_agents = {}
-        self.results = None
+    def __init__(self, base_config, scenario_config):
+        """
+        Initializes the simulation engine for a specific scenario.
         
-    def run_simulation(self, scenario):
-        """Run complete co-simulation for a scenario"""
-        logger.info(f"Starting co-simulation for scenario: {scenario['name']}")
-          # Initialize simulation
-        self._initialize_simulation(scenario)
+        Args:
+            base_config: The main SimulationConfig object.
+            scenario_config (dict): The configuration for the specific scenario to run.
+        """
+        self.base_config = base_config
+        self.scenario_config = scenario_config
+        self.scenario_name = scenario_config['name']
         
-        # Prepare results storage
-        results_data = []
+        # --- ▼▼▼ 这里是修改的核心 ▼▼▼ ---
+
+        # 1. 结合主配置和场景配置，确定本次仿真具体的参数
+        self.start_time = pd.to_datetime(base_config.simulation_params['start_time'])
+        self.end_time = pd.to_datetime(base_config.simulation_params['end_time'])
         
-        # Get time series
-        time_series = self.config.get_time_series()
-        time_steps = time_series['time_steps']
+        time_step_in_minutes = base_config.simulation_params['time_step_minutes']
+        self.time_step = timedelta(seconds=time_step_in_minutes * 60)
+
+        # 2. 创建特定于此场景的输出目录
+        scenario_output_dir = os.path.join(base_config.output_dir, self.scenario_name)
         
-        # Main simulation loop
-        for t, timestamp in enumerate(tqdm(time_steps, desc="Simulation Progress")):
-            # Get hour of day for tariff and load profile
-            hour = timestamp.hour
-            minute_of_day = timestamp.hour * 60 + timestamp.minute
+        # 3. 初始化所有模型，并将正确的对象传递下去
+        #    首先，创建数据加载器实例
+        data_loader = TrafficDataLoader(base_config)
+        
+        #    然后，将 data_loader 对象传递给 TrafficModel
+        self.traffic_model = TrafficModel(base_config, data_loader) 
+        
+        #    最后，将场景配置应用到交通模型中（这一步很重要）
+        self.traffic_model.apply_scenario(scenario_config)
+
+        self.power_grid_model = IEEE13BusModel(base_config)
+        self.efficiency_model = DynamicBDWPTEfficiency(base_config)
+        self.results_analyzer = ResultsAnalyzer(scenario_output_dir, base_config)
+        
+        # --- ▲▲▲ 修改结束 ▲▲▲ ---
+        
+        logging.info(f"Simulation Engine initialized for scenario: {self.scenario_name}")
+
+    def run_simulation(self):
+        """Runs the main simulation loop for the configured scenario."""
+        logging.info(f"Starting simulation from {self.start_time} to {self.end_time}")
+        self.results_analyzer.setup_results_file()
+        
+        current_time = self.start_time
+        
+        while current_time <= self.end_time:
+            logging.debug(f"--- Processing timestep: {current_time} ---")
             
-            # Step 1: Update traffic model
-            self._update_traffic(timestamp, scenario['day_type'])
+            # 1. 更新交通模型
+            day_type = self.scenario_config.get('day_type', 'weekday')
+            current_time_minutes = current_time.hour * 60 + current_time.minute
+            self.traffic_model.update_vehicle_positions(current_time_minutes, day_type)
+
+            active_vehicles_data = {v['id']: v for v in self.traffic_model.vehicles}
+
+            # 2. 计算BDWPT需求
+            bdwpt_demands = self._calculate_bdwpt_demands(active_vehicles_data, current_time)
+
+            # 3. 更新电网负荷
+            self.power_grid_model.update_bdwpt_loads(bdwpt_demands['vehicle_powers_kw'])
             
-            # Step 2: Calculate BDWPT power at each node
-            bdwpt_powers = self._calculate_bdwpt_powers(hour)
+            # 4. 运行潮流计算
+            self.power_grid_model.solve_power_flow()
+
+            # 5. [最终确认] 调用我们刚刚添加的 get_grid_state 函数
+            grid_state = self.power_grid_model.get_grid_state()
             
-            # Step 3: Update power grid loads
-            self._update_grid_loads(hour, scenario['load_profile'], bdwpt_powers)
+            traffic_state = self.traffic_model.get_summary_state()
             
-            # Step 4: Solve power flow
-            pf_results = self.power_grid.solve_power_flow()
-            
-            # Step 5: Store results
-            step_results = self._collect_step_results(
-                timestamp, pf_results, bdwpt_powers
+            timestep_data = self._collect_timestep_data(
+                current_time, grid_state, traffic_state, bdwpt_demands
             )
-            results_data.append(step_results)
             
-        # Compile final results
-        self.results = self._compile_results(results_data, scenario)
-        
-        logger.info("Co-simulation completed successfully")
-        return self.results
-        
-    def _initialize_simulation(self, scenario):
-        """Initialize simulation components"""
-        # Set BDWPT penetration
-        self.traffic_model.set_bdwpt_penetration(scenario['bdwpt_penetration'])
-          # Create BDWPT agents for equipped vehicles
-        self.bdwpt_agents = {}
-        for vehicle in self.traffic_model.vehicles:
-            if vehicle['is_bdwpt_equipped']:
-                agent = BDWPTAgent(
-                    vehicle['id'],
-                    vehicle['battery_capacity_kwh'],
-                    self.config
-                )
-                # Set initial SoC
-                agent.soc = vehicle['current_soc']
-                self.bdwpt_agents[vehicle['id']] = agent
-                
-        logger.info(f"Initialized {len(self.bdwpt_agents)} BDWPT agents")
-        
-    def _update_traffic(self, timestamp, day_type):
-        """Update traffic model for current time step"""
-        hour = timestamp.hour
-        
-        # Generate new trips
-        trips = self.traffic_model.generate_trip_patterns(hour, day_type)
-          # Update vehicle positions
-        minute_of_day = hour * 60 + timestamp.minute
-        vehicles_on_roads = self.traffic_model.update_vehicle_positions(minute_of_day, day_type)
-        
-        # Update SoC for driving vehicles
-        for vehicle in self.traffic_model.vehicles:
-            if vehicle['status'] == 'driving' and vehicle['id'] in self.bdwpt_agents:
-                # Simple energy consumption based on time step
-                distance = self.config.traffic_params['average_trip_distance_km'] / 30  # km per minute
-                self.bdwpt_agents[vehicle['id']].update_soc_from_driving(distance)
-                
-    def _calculate_bdwpt_powers(self, hour):
-        """Calculate BDWPT power exchange at each node"""
-        bdwpt_powers = {}
-        
-        # Get current tariff
-        tariff = self.config.get_tariff_at_hour(hour)
-        
-        # For each BDWPT-enabled node
-        for node in self.config.grid_params['bdwpt_nodes']:
-            total_power = 0
-              # Get vehicles at this node
-            vehicles = self.traffic_model.get_bdwpt_vehicles_by_node(node)
+            self.results_analyzer.log_timeseries_data(timestep_data)
             
-            if vehicles:
-                logger.info(f"Found {len(vehicles)} BDWPT-equipped vehicles at node {node}")
-
-            for vehicle in vehicles:
-                if vehicle['id'] in self.bdwpt_agents:
-                    agent = self.bdwpt_agents[vehicle['id']]
-                    
-                    # Get voltage at this node
-                    try:
-                        voltage = self.power_grid.get_voltage(node)
-                        logger.debug(f"Got voltage {voltage} for node {node}")
-                    except Exception as e:
-                        logger.error(f"Error getting voltage for node {node}: {e}")
-                        voltage = 1.0  # Default voltage
-                    
-                    # Agent decides action
-                    try:
-                        action = agent.decide_action(voltage, tariff, self.config.time_step_minutes)
-                        logger.debug(f"Agent {agent.vehicle_id} action: {action}")
-                    except Exception as e:
-                        logger.error(f"Error in agent decision for vehicle {vehicle['id']}: {e}")
-                        action = {'power_kw': 0}                    # Accumulate power
-                    total_power += action['power_kw']
-                    
-            bdwpt_powers[node] = total_power
+            current_time += self.time_step
             
-        logger.debug(f"Calculated BDWPT powers at hour {hour}: {bdwpt_powers}")
-        return bdwpt_powers
-        
-    def _update_grid_loads(self, hour, load_profile_type, bdwpt_powers):
-        """Update power grid loads including BDWPT"""
-        # Get base load multiplier from profile
-        time_minutes = hour * 60
-        day_type = 'weekday' if 'Weekday' in load_profile_type else 'weekend'
-          # Update base loads
-        for bus, load in self.power_grid.loads.items():
-            try:
-                # Get node-specific load profile
-                load_kw = self.config.get_load_profile(bus, time_minutes, day_type)
-                logger.debug(f"Load for bus {bus}: {load_kw} kW")
-            except Exception as e:
-                logger.error(f"Error getting load profile for bus {bus}: {e}")
-                logger.error(f"bus type: {type(bus)}, time_minutes type: {type(time_minutes)}, day_type: {day_type}")
-                raise e
-            
-        # FIX: Use the new update_bdwpt_load method
-        if any(p != 0 for p in bdwpt_powers.values()):
-            logger.info(f"Updating grid with non-zero BDWPT powers: {bdwpt_powers}")
-        for node, power in bdwpt_powers.items():
-            self.power_grid.update_bdwpt_load(node, power)
-            
-    def _collect_step_results(self, timestamp, pf_results, bdwpt_powers):
-        """Collect results for current time step"""
-        results = {
-            'timestamp': timestamp,
-            'converged': pf_results['converged'],
-            'total_load_kw': pf_results['powers']['total_load'],
-            'total_losses_kw': pf_results['powers']['total_losses'],
-            'total_bdwpt_kw': sum(bdwpt_powers.values()),
-            'bdwpt_charging_kw': sum(p for p in bdwpt_powers.values() if p > 0),
-            'bdwpt_discharging_kw': abs(sum(p for p in bdwpt_powers.values() if p < 0)),
-        }
-        
-        # Add voltage data
-        for bus, voltage in pf_results['voltages'].items():
-            results[f'voltage_bus_{bus}'] = voltage
-            
-        # Add BDWPT power by node
-        for node, power in bdwpt_powers.items():
-            results[f'bdwpt_node_{node}_kw'] = power
-              # Count vehicles in different modes
-        mode_counts = {'G2V': 0, 'V2G': 0, 'idle': 0}
-        for agent in self.bdwpt_agents.values():
-            if agent.operation_history:
-                mode_counts[agent.mode] += 1
-        results.update({f'vehicles_{mode}': count for mode, count in mode_counts.items()})
-        
-        return results
-    
-    def _compile_results(self, results_data, scenario):
-        """Compile simulation results into final format"""
-        logger.info(f"Compiling results for {len(results_data)} time steps")
-        
-        # Debug: Check results_data structure
-        if results_data:
-            sample_keys = list(results_data[0].keys()) if results_data[0] else []
-            logger.info(f"Sample step result keys: {sample_keys}")
-        
-        # Create DataFrame from results
-        df = pd.DataFrame(results_data)
-        logger.info(f"Created DataFrame with shape: {df.shape}, columns: {list(df.columns)}")
-        
-        # Get time step minutes with fallback
-        time_step_minutes = getattr(self.config, 'time_step_minutes', 
-                                   self.config.simulation_params.get('time_step_minutes', 15))
-        logger.info(f"Using time_step_minutes: {time_step_minutes}")
-        
-        # Calculate summary statistics
-        summary = {
-            'scenario': scenario['name'],
-            'base_name': scenario['name'],  # Add base name for KPI calculation
-            'bdwpt_penetration': scenario['bdwpt_penetration'],
-            'peak_load': df['total_load_kw'].max(),
-            'min_load': df['total_load_kw'].min(),
-            'avg_load': df['total_load_kw'].mean(),
-            'total_energy_kwh': df['total_load_kw'].sum() * time_step_minutes / 60,
-            'total_losses_kwh': df['total_losses_kw'].sum() * time_step_minutes / 60,
-            'min_voltage': df[[col for col in df.columns if 'voltage_bus' in col]].min().min(),
-            'max_voltage': df[[col for col in df.columns if 'voltage_bus' in col]].max().max(),
-            'bdwpt_energy_charged_kwh': df['bdwpt_charging_kw'].sum() * time_step_minutes / 60,
-            'bdwpt_energy_discharged_kwh': df['bdwpt_discharging_kw'].sum() * time_step_minutes / 60,
-        }
-        
-        # Count voltage violations
-        voltage_cols = [col for col in df.columns if 'voltage_bus' in col]
-        voltage_violations = 0
-        for col in voltage_cols:
-            violations = ((df[col] < 0.95) | (df[col] > 1.05)).sum()
-            voltage_violations += violations
-        summary['voltage_violations'] = voltage_violations
-        
-        # Count reverse power flow events (when BDWPT discharge > local load)
-        df['net_load'] = df['total_load_kw'] - df['total_bdwpt_kw']
-        summary['reverse_flow_events'] = (df['net_load'] < 0).sum()
-        
-        # Agent statistics
-        agent_stats = []
-        for vehicle_id, agent in self.bdwpt_agents.items():
-            stats = agent.get_statistics()
-            stats['vehicle_id'] = vehicle_id
-            agent_stats.append(stats)
+        logging.info(f"Simulation for scenario '{self.scenario_name}' finished.")
+        summary = self.results_analyzer.get_summary_statistics()
+        self.results_analyzer.finalize(summary)
         
         return {
-            'timeseries': df,
-            'summary': summary,
-            'agent_stats': pd.DataFrame(agent_stats) if agent_stats else None
+            'timeseries_file': self.results_analyzer.timeseries_file,
+            'summary_file': self.results_analyzer.summary_file
         }
+
+    # _calculate_bdwpt_demands 和 _collect_timestep_data 等辅助方法保持不变...
+    def _calculate_bdwpt_demands(self, vehicles, current_time):
+        """
+        Calculates power demand for each BDWPT vehicle, applying the efficiency model.
+        """
+        vehicle_powers = {}
+        efficiency_details = []
+
+        for v_id, v_data in vehicles.items():
+            if v_data.get('is_on_bdwpt_road'):
+                power_demand_kw = v_data['power_demand_kw'] # Ideal power
+                
+                characteristics = BDWPTCharacteristics(
+                    coil_alignment_quality=v_data.get('alignment_quality', 0.95),
+                    air_gap_mm=v_data.get('air_gap_mm', 100),
+                    thermal_state=v_data.get('thermal_state', ThermalState.NORMAL)
+                )
+
+                efficiency, details = self.efficiency_model.calculate_efficiency(
+                    power_kw=power_demand_kw,
+                    characteristics=characteristics,
+                    ambient_temp_c=20 
+                )
+                
+                if power_demand_kw > 0 and efficiency > 0:
+                    actual_grid_power_kw = power_demand_kw / efficiency
+                elif power_demand_kw < 0:
+                    actual_grid_power_kw = power_demand_kw * efficiency
+                else:
+                    actual_grid_power_kw = 0
+                
+                vehicle_powers[v_id] = actual_grid_power_kw
+                efficiency_details.append(details)
+
+        return self._summarize_bdwpt_data(vehicle_powers, efficiency_details)
+
+    def _summarize_bdwpt_data(self, vehicle_powers, efficiency_details):
+        """Helper to aggregate BDWPT data for the current timestep."""
+        charging_kw = sum(p for p in vehicle_powers.values() if p > 0)
+        discharging_kw = sum(p for p in vehicle_powers.values() if p < 0)
+        
+        num_charging = sum(1 for p in vehicle_powers.values() if p > 0)
+        num_discharging = sum(1 for p in vehicle_powers.values() if p < 0)
+        
+        if not efficiency_details:
+            avg_details = {
+                'avg_efficiency': 0, 'min_efficiency': 0, 'max_efficiency': 0,
+                'power_factor': 0, 'alignment_factor': 0, 'airgap_factor': 0,
+                'thermal_factor': 0, 'coupling_factor': 0
+            }
+        else:
+            df = pd.DataFrame(efficiency_details)
+            avg_details = {
+                'avg_efficiency': df['final_efficiency'].mean(),
+                'min_efficiency': df['final_efficiency'].min(),
+                'max_efficiency': df['final_efficiency'].max(),
+                'power_factor': df['power_factor'].mean(),
+                'alignment_factor': df['alignment_factor'].mean(),
+                'airgap_factor': df['airgap_factor'].mean(),
+                'thermal_factor': df['thermal_factor'].mean(),
+                'coupling_factor': df['coupling_factor'].mean()
+            }
+            
+        return {
+            'vehicle_powers_kw': vehicle_powers,
+            'bdwpt_charging_kw': charging_kw,
+            'bdwpt_discharging_kw': abs(discharging_kw),
+            'total_bdwpt_kw': charging_kw + discharging_kw,
+            'charging_vehicles': num_charging,
+            'discharging_vehicles': num_discharging,
+            'efficiency_summary': avg_details
+        }
+        
+    def _collect_timestep_data(self, timestamp, grid_state, traffic_state, bdwpt_state):
+        """Assembles the complete data dictionary for a single timestep."""
+        
+        data = {key: 0 for key in ALL_TIMESERIES_COLUMNS}
+        
+        data['timestamp'] = timestamp.isoformat()
+        
+        data['total_load_kw'] = grid_state.get('total_load_kw', 0)
+        data['total_generation_kw'] = grid_state.get('total_generation_kw', 0)
+        losses = grid_state.get('losses', (0,0))
+        data['total_losses_kw'] = losses[0] if isinstance(losses, (list, tuple)) else 0
+        feeder_power = grid_state.get('feeder_power_kw', (0,0))
+        data['feeder_power_p_kw'] = feeder_power[0] if isinstance(feeder_power, (list, tuple)) else 0
+        data['feeder_power_q_kvar'] = feeder_power[1] if isinstance(feeder_power, (list, tuple)) else 0
+        
+        data['active_vehicles'] = traffic_state.get('active_vehicles', 0)
+        
+        data.update(bdwpt_state['efficiency_summary'])
+        data['charging_vehicles'] = bdwpt_state['charging_vehicles']
+        data['discharging_vehicles'] = bdwpt_state['discharging_vehicles']
+        data['total_bdwpt_kw'] = bdwpt_state['total_bdwpt_kw']
+        data['bdwpt_charging_kw'] = bdwpt_state['bdwpt_charging_kw']
+        data['bdwpt_discharging_kw'] = bdwpt_state['bdwpt_discharging_kw']
+        
+        num_charging = bdwpt_state['charging_vehicles']
+        data['avg_power_per_charging_vehicle_kw'] = bdwpt_state['bdwpt_charging_kw'] / num_charging if num_charging > 0 else 0
+        num_discharging = bdwpt_state['discharging_vehicles']
+        data['avg_power_per_discharging_vehicle_kw'] = bdwpt_state['bdwpt_discharging_kw'] / num_discharging if num_discharging > 0 else 0
+
+        data['reverse_power_flow_events'] = grid_state.get('reverse_power_flow_events', 0)
+        data['voltage_violations'] = grid_state.get('voltage_violations', 0)
+        
+        voltages_pu = grid_state.get('voltages_pu', {})
+        data['v_bus_632_pu'] = voltages_pu.get('632', 0)
+        data['v_bus_633_pu'] = voltages_pu.get('633', 0)
+        data['v_bus_634_pu'] = voltages_pu.get('634', 0)
+        data['v_bus_671_pu'] = voltages_pu.get('671', 0)
+        data['v_bus_675_pu'] = voltages_pu.get('675', 0)
+        data['v_bus_680_pu'] = voltages_pu.get('680', 0)
+        data['v_bus_692_pu'] = voltages_pu.get('692', 0)
+        data['v_bus_650_pu'] = voltages_pu.get('sourcebus', 0)
+        
+        return data

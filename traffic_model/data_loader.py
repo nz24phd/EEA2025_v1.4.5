@@ -10,9 +10,8 @@ logger = logging.getLogger(__name__)
 
 class TrafficDataLoader:
     """Load and preprocess traffic data for simulation"""
-    
-    def __init__(self, data_dir="data"):
-        self.data_dir = data_dir
+    def __init__(self, config):
+        self.data_dir = config.data_dir
         self.traffic_data = None
         self.census_data = None
         self.road_network = None

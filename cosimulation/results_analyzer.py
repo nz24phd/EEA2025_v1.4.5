@@ -1,101 +1,108 @@
-# filepath: d:\1st_year_PhD\EEA_2025\EEA2025_v1.4.1\cosimulation\results_analyzer.py
-# /3_cosimulation/results_analyzer.py
+# EEA2025_v1.4.5_fixed/cosimulation/results_analyzer.py
 
-import pandas as pd
+import os
+import csv
 import logging
+import json
+import pandas as pd
 
-logger = logging.getLogger(__name__)
+# Define all expected columns for the timeseries data. This is the single source of truth.
+ALL_TIMESERIES_COLUMNS = [
+    'timestamp', 'total_load_kw', 'total_generation_kw', 'total_losses_kw', 
+    'feeder_power_p_kw', 'feeder_power_q_kvar',
+    'active_vehicles', 'charging_vehicles', 'discharging_vehicles',
+    'total_bdwpt_kw', 'bdwpt_charging_kw', 'bdwpt_discharging_kw',
+    'avg_efficiency', 'min_efficiency', 'max_efficiency',
+    'reverse_power_flow_events', 'voltage_violations',
+    # Add specific bus voltages as requested (example buses)
+    'v_bus_632_pu', 'v_bus_633_pu', 'v_bus_634_pu', 'v_bus_671_pu',
+    'v_bus_675_pu', 'v_bus_680_pu', 'v_bus_692_pu', 'v_bus_650_pu',
+    # Add more detailed BDWPT stats
+    'avg_power_per_charging_vehicle_kw', 'avg_power_per_discharging_vehicle_kw',
+    'efficiency_power_factor', 'efficiency_alignment_factor', 'efficiency_airgap_factor',
+    'efficiency_thermal_factor', 'efficiency_coupling_factor'
+]
 
 class ResultsAnalyzer:
-    """
-    Analyzes and compares simulation results to calculate Key Performance Indicators (KPIs).
-    """
+    """Handles the collection, processing, and output of simulation results."""
 
-    def __init__(self, config):
+    def __init__(self, output_dir, config):
+        self.output_dir = output_dir
         self.config = config
-
-    def calculate_kpis(self, all_results):
-        """
-        Calculate Key Performance Indicators (KPIs) for all scenarios by comparing
-        them against their respective baseline (0% penetration).
-
-        Args:
-            all_results (dict): A dictionary where keys are scenario names and
-                                values are the result dictionaries from the simulation engine.
-
-        Returns:
-            dict: A dictionary of calculated KPIs for each scenario.
-        """
-        kpis = {}
-
-        # First, identify the baseline results for each scenario type
-        # Extract base scenario type from scenario name (e.g., "Weekday Peak_0%" -> "Weekday Peak")
-        baseline_results = {}
-        for scenario_name, results in all_results.items():
-            if results['summary']['bdwpt_penetration'] == 0:
-                # Extract base scenario name (e.g., "Weekday Peak_0%" -> "Weekday Peak")
-                base_scenario = scenario_name.replace("_0%", "")
-                baseline_results[base_scenario] = results
-                logger.debug(f"Found baseline for '{base_scenario}': {scenario_name}")
+        self.timeseries_file = os.path.join(self.output_dir, 'timeseries_data.csv')
+        self.summary_file = os.path.join(self.output_dir, 'summary_statistics.txt')
+        self.writer = None
+        self.file = None
         
-        if not baseline_results:
-            logger.warning("No baseline (0% penetration) scenarios found. KPI calculation will be limited.")
-            return kpis
+        # Ensure the output directory exists
+        os.makedirs(self.output_dir, exist_ok=True)
+        logging.info(f"Results will be saved in: {self.output_dir}")
 
-        logger.info(f"Found baselines for: {list(baseline_results.keys())}")
+    def setup_results_file(self):
+        """Sets up the CSV file for timeseries data using DictWriter."""
+        try:
+            self.file = open(self.timeseries_file, 'w', newline='', encoding='utf-8')
+            # Use DictWriter for robust column handling
+            self.writer = csv.DictWriter(self.file, fieldnames=ALL_TIMESERIES_COLUMNS)
+            self.writer.writeheader()
+            logging.info(f"Timeseries CSV file created with {len(ALL_TIMESERIES_COLUMNS)} columns.")
+        except IOError as e:
+            logging.error(f"Failed to open results file {self.timeseries_file}: {e}")
+            raise
 
-        # Now, calculate KPIs for each scenario relative to its baseline
-        for scenario_name, results in all_results.items():
-            if results['summary']['bdwpt_penetration'] == 0:
-                # For baseline, KPI is just its own value
-                kpi = {
-                    'scenario': scenario_name,
-                    'peak_reduction_kw': 0,
-                    'peak_reduction_pct': 0,
-                    'voltage_violations': results['summary']['voltage_violations'],
-                    'voltage_improvement': 0,
-                    'losses_kwh': results['summary']['total_losses_kwh'],
-                    'loss_reduction_kwh': 0,
-                    'reverse_flow_events': results['summary']['reverse_flow_events'],
-                    'energy_from_v2g_kwh': results['summary']['bdwpt_energy_discharged_kwh'],
-                    'energy_to_g2v_kwh': results['summary']['bdwpt_energy_charged_kwh'],
-                }
-                kpis[scenario_name] = kpi
-                logger.debug(f"Added baseline KPI for {scenario_name}")
-                continue
+    def log_timeseries_data(self, data_dict):
+        """Logs a complete dictionary of data for a single timestep."""
+        if self.writer:
+            try:
+                # DictWriter will handle missing keys, filling them with empty strings.
+                # It's better to ensure the input dict is complete.
+                self.writer.writerow(data_dict)
+            except Exception as e:
+                logging.error(f"Error writing timeseries data: {e}")
 
-            # Extract base scenario name for non-baseline scenarios
-            # e.g., "Weekday Peak_15%" -> "Weekday Peak"
-            base_scenario = "_".join(scenario_name.split("_")[:-1])
-            baseline = baseline_results.get(base_scenario)
+    def finalize(self, summary_stats):
+        """Writes summary statistics and closes the results file."""
+        if self.file and not self.file.closed:
+            self.file.close()
+            logging.info("Timeseries data file closed.")
 
-            if not baseline:
-                logger.warning(f"Could not find baseline for scenario: {scenario_name} (looking for baseline: {base_scenario}). Skipping KPI calculation.")
-                logger.debug(f"Available baselines: {list(baseline_results.keys())}")
-                continue
-
-            # Calculate KPIs
-            peak_reduction = baseline['summary']['peak_load'] - results['summary']['peak_load']
-            peak_reduction_pct = (peak_reduction / baseline['summary']['peak_load']) * 100 if baseline['summary']['peak_load'] > 0 else 0
+        try:
+            with open(self.summary_file, 'w', encoding='utf-8') as f:
+                f.write("--- Simulation Summary Statistics ---\n\n")
+                for key, value in summary_stats.items():
+                    if isinstance(value, pd.Series):
+                        f.write(f"{key}:\n{value.to_string()}\n\n")
+                    elif isinstance(value, dict):
+                         f.write(f"{key}:\n")
+                         for sub_key, sub_value in value.items():
+                             f.write(f"  {sub_key}: {sub_value}\n")
+                         f.write("\n")
+                    else:
+                        f.write(f"{key}: {value}\n")
+            logging.info(f"Summary statistics saved to {self.summary_file}")
+        except IOError as e:
+            logging.error(f"Failed to write summary file {self.summary_file}: {e}")
             
-            voltage_improvement = baseline['summary']['voltage_violations'] - results['summary']['voltage_violations']
-            
-            loss_reduction = baseline['summary']['total_losses_kwh'] - results['summary']['total_losses_kwh']
-
-            kpi = {
-                'scenario': scenario_name,
-                'peak_reduction_kw': peak_reduction,
-                'peak_reduction_pct': peak_reduction_pct,
-                'voltage_violations': results['summary']['voltage_violations'],
-                'voltage_improvement': voltage_improvement,
-                'losses_kwh': results['summary']['total_losses_kwh'],
-                'loss_reduction_kwh': loss_reduction,
-                'reverse_flow_events': results['summary']['reverse_flow_events'],
-                'energy_from_v2g_kwh': results['summary']['bdwpt_energy_discharged_kwh'],
-                'energy_to_g2v_kwh': results['summary']['bdwpt_energy_charged_kwh'],
+    def get_summary_statistics(self):
+        """
+        Calculates and returns summary statistics from the generated timeseries data.
+        This is called after the simulation is complete.
+        """
+        try:
+            df = pd.read_csv(self.timeseries_file)
+            summary = {
+                "Simulation Duration": f"{(pd.to_datetime(df['timestamp'].iloc[-1]) - pd.to_datetime(df['timestamp'].iloc[0]))}",
+                "Total Timesteps": len(df),
+                "Grid Loading (kW)": df['total_load_kw'].describe(),
+                "Grid Losses (kW)": df['total_losses_kw'].describe(),
+                "BDWPT Charging (kW)": df['bdwpt_charging_kw'][df['bdwpt_charging_kw'] > 0].describe(),
+                "BDWPT Discharging (kW)": df['bdwpt_discharging_kw'][df['bdwpt_discharging_kw'] > 0].describe(),
+                "Overall Efficiency (%)": (df['avg_efficiency'] * 100).describe(),
+                "Active Vehicles": df['active_vehicles'].describe(),
+                "Final Reverse Power Flow Events": df['reverse_power_flow_events'].iloc[-1],
+                "Final Voltage Violations": df['voltage_violations'].iloc[-1]
             }
-            kpis[scenario_name] = kpi
-            logger.info(f"Calculated KPIs for {scenario_name} relative to baseline {base_scenario}")
-        
-        logger.info("KPI calculation complete.")
-        return kpis
+            return summary
+        except (FileNotFoundError, pd.errors.EmptyDataError) as e:
+            logging.error(f"Cannot generate summary, timeseries file is missing or empty: {e}")
+            return {"Error": "Could not generate summary statistics."}
